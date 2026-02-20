@@ -142,10 +142,37 @@ class IndusagiRPC {
           // Handle tool execution events
           if (response.type === "tool_execution_start") {
             sidebarProvider?.sendMessageToWebview({
-              type: "toolExecution",
-              tool: response.tool,
-              args: response.args
+              type: "toolEvent",
+              phase: "start",
+              toolName: response.toolName,
+              args: response.args,
+              toolCallId: response.toolCallId,
             });
+            continue;
+          }
+
+          if (response.type === "tool_execution_update") {
+            sidebarProvider?.sendMessageToWebview({
+              type: "toolEvent",
+              phase: "update",
+              toolName: response.toolName,
+              toolCallId: response.toolCallId,
+              args: response.args,
+              partialResult: response.partialResult,
+            });
+            continue;
+          }
+
+          if (response.type === "tool_execution_end") {
+            sidebarProvider?.sendMessageToWebview({
+              type: "toolEvent",
+              phase: "end",
+              toolName: response.toolName,
+              toolCallId: response.toolCallId,
+              result: response.result,
+              isError: response.isError,
+            });
+            continue;
           }
 
           // Handle regular responses
@@ -256,12 +283,58 @@ class IndusagiRPC {
     return typeof data === "string" ? data : data?.path ?? "";
   }
 
-  async compact(): Promise<void> {
-    await this.sendRequest("compact", {});
+  async compact(customInstructions?: string): Promise<any> {
+    return this.sendRequest("compact", customInstructions ? { customInstructions } : {});
   }
 
   async setAutoCompaction(enabled: boolean): Promise<void> {
     await this.sendRequest("set_auto_compaction", { enabled });
+  }
+
+  async steer(message: string): Promise<void> {
+    await this.sendRequest("steer", { message });
+  }
+
+  async followUp(message: string): Promise<void> {
+    await this.sendRequest("follow_up", { message });
+  }
+
+  async abort(): Promise<void> {
+    await this.sendRequest("abort", {});
+  }
+
+  async bash(command: string): Promise<any> {
+    const res = await this.sendRequest("bash", { command });
+    return this.unwrapData<any>(res);
+  }
+
+  async abortBash(): Promise<void> {
+    await this.sendRequest("abort_bash", {});
+  }
+
+  async setAutoRetry(enabled: boolean): Promise<void> {
+    await this.sendRequest("set_auto_retry", { enabled });
+  }
+
+  async abortRetry(): Promise<void> {
+    await this.sendRequest("abort_retry", {});
+  }
+
+  async fork(entryId: string): Promise<any> {
+    const res = await this.sendRequest("fork", { entryId });
+    return this.unwrapData<any>(res);
+  }
+
+  async getForkMessages(): Promise<any[]> {
+    const res = await this.sendRequest("get_fork_messages", {});
+    const data = this.unwrapData<any>(res);
+    return Array.isArray(data) ? data : (Array.isArray(data?.messages) ? data.messages : []);
+  }
+
+  async getLastAssistantText(): Promise<string> {
+    const res = await this.sendRequest("get_last_assistant_text", {});
+    const data = this.unwrapData<any>(res);
+    return typeof data === "string" ? data : (data?.text || "");
   }
 
   getCurrentState(): any {
@@ -359,6 +432,148 @@ export function activate(context: vscode.ExtensionContext) {
     }
   });
 
+  const handleSlashCommand = async (raw: string): Promise<boolean> => {
+    if (!raw.startsWith("/")) return false;
+    const [cmd, ...rest] = raw.trim().split(/\s+/);
+    const argText = rest.join(" ").trim();
+
+    const notSupported = (name: string, extra?: string) => {
+      const msg = `⚠️ ${name} is not yet fully supported in VS Code extension.${extra ? "\n" + extra : ""}`;
+      sidebarProvider.sendMessageToWebview({ type: "addMessage", content: msg });
+    };
+
+    try {
+      switch (cmd.toLowerCase()) {
+        case "/help":
+          sidebarProvider.sendMessageToWebview({
+            type: "addMessage",
+            content: [
+              "📘 Slash commands (VS Code)",
+              "/new, /clear, /state, /session, /sessions, /switch <path>",
+              "/models, /model provider::modelId, /thinking <level>",
+              "/compact [instructions], /stats, /export",
+              "/steer <msg>, /followup <msg>, /abort",
+              "/bash <cmd>, /abort_bash",
+              "/auto_compact on|off, /auto_retry on|off, /abort_retry",
+              "/name <alias>, /last, /copy",
+              "(CLI-only for now: /settings, /scoped-models, /share, /fork, /tree, /login, /logout, /resume, /reload, /changelog, /hotkeys)",
+            ].join("\n"),
+          });
+          return true;
+        case "/new":
+        case "/clear":
+          await vscode.commands.executeCommand("indusagi.newSession");
+          return true;
+        case "/state": {
+          const state = await rpc.getState();
+          sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+          await sendSessionHistoryToWebview(state);
+          return true;
+        }
+        case "/session":
+          await vscode.commands.executeCommand("indusagi.getStats");
+          return true;
+        case "/models":
+          await vscode.commands.executeCommand("indusagi.getModels");
+          return true;
+        case "/model":
+          if (!argText) throw new Error("Usage: /model provider::modelId");
+          await vscode.commands.executeCommand("indusagi.setModel", argText);
+          return true;
+        case "/thinking":
+          if (!argText) throw new Error("Usage: /thinking off|minimal|low|medium|high|xhigh");
+          await vscode.commands.executeCommand("indusagi.setThinking", argText);
+          return true;
+        case "/compact": {
+          const result: any = await rpc.compact(argText || undefined);
+          const data = result?.data ?? {};
+          if (data?.summary) {
+            sidebarProvider.sendMessageToWebview({ type: "addMessage", content: `📦 Compaction summary:\n${data.summary}` });
+          }
+          return true;
+        }
+        case "/stats":
+          await vscode.commands.executeCommand("indusagi.getStats");
+          return true;
+        case "/export":
+          await vscode.commands.executeCommand("indusagi.exportHtml");
+          return true;
+        case "/steer":
+          if (!argText) throw new Error("Usage: /steer <message>");
+          await rpc.steer(argText);
+          return true;
+        case "/followup":
+        case "/follow_up":
+          if (!argText) throw new Error("Usage: /followup <message>");
+          await rpc.followUp(argText);
+          return true;
+        case "/abort":
+          await rpc.abort();
+          return true;
+        case "/bash": {
+          if (!argText) throw new Error("Usage: /bash <command>");
+          const data = await rpc.bash(argText);
+          sidebarProvider.sendMessageToWebview({ type: "addMessage", content: `💻 Bash (exit ${data?.exitCode ?? "?"}):\n${data?.output || ""}` });
+          return true;
+        }
+        case "/abort_bash":
+          await rpc.abortBash();
+          return true;
+        case "/auto_compact":
+          await rpc.setAutoCompaction(argText === "on" || argText === "true" || argText === "1");
+          return true;
+        case "/auto_retry":
+          await rpc.setAutoRetry(argText === "on" || argText === "true" || argText === "1");
+          return true;
+        case "/abort_retry":
+          await rpc.abortRetry();
+          return true;
+        case "/sessions":
+          await sendSessionHistoryToWebview();
+          return true;
+        case "/switch":
+          if (!argText) throw new Error("Usage: /switch <sessionPath>");
+          await vscode.commands.executeCommand("indusagi.switchSession", argText);
+          return true;
+        case "/name": {
+          const state = await rpc.getState();
+          if (!state?.sessionFile) throw new Error("No active session file");
+          await vscode.commands.executeCommand("indusagi.setSessionAlias", { path: state.sessionFile, alias: argText });
+          return true;
+        }
+        case "/last": {
+          const text = await rpc.getLastAssistantText();
+          sidebarProvider.sendMessageToWebview({ type: "addMessage", content: `🧾 Last assistant text:\n${text}` });
+          return true;
+        }
+        case "/copy": {
+          const text = await rpc.getLastAssistantText();
+          await vscode.env.clipboard.writeText(text || "");
+          sidebarProvider.sendMessageToWebview({ type: "addMessage", content: "📋 Copied last assistant message." });
+          return true;
+        }
+        case "/settings":
+        case "/scoped-models":
+        case "/share":
+        case "/fork":
+        case "/tree":
+        case "/login":
+        case "/logout":
+        case "/resume":
+        case "/reload":
+        case "/changelog":
+        case "/hotkeys":
+          notSupported(cmd);
+          return true;
+        default:
+          return false;
+      }
+    } catch (error: any) {
+      sidebarProvider.sendMessageToWebview({ type: "addMessage", content: `❌ Slash command error: ${error.message}` });
+      return true;
+    }
+  };
+
   // Register chat command (for sidebar)
   const chatCommand = vscode.commands.registerCommand("indusagi.chat", async (message?: string) => {
     const editor = vscode.window.activeTextEditor;
@@ -380,6 +595,11 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     if (!userMessage) {
+      return;
+    }
+
+    // Handle slash commands (CLI-like controls)
+    if (await handleSlashCommand(userMessage.trim())) {
       return;
     }
 

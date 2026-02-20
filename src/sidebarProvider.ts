@@ -141,6 +141,25 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       padding: 8px;
     }
     .row { margin-top: 8px; display:flex; gap:8px; flex-wrap: wrap; }
+    .slash-menu {
+      margin-top: 6px;
+      border: 1px solid var(--vscode-sideBar-border);
+      border-radius: 6px;
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      max-height: 180px;
+      overflow: auto;
+      display: none;
+    }
+    .slash-item {
+      padding: 6px 8px;
+      font-size: 12px;
+      cursor: pointer;
+      border-bottom: 1px solid var(--vscode-sideBar-border);
+    }
+    .slash-item:last-child { border-bottom: 0; }
+    .slash-item:hover { background: var(--vscode-list-hoverBackground); }
+    .slash-cmd { font-weight: 600; margin-right: 6px; }
+    .slash-desc { opacity: .8; }
     button {
       border: 0;
       border-radius: 6px;
@@ -153,6 +172,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     .msg { margin-bottom: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-sideBar-border); }
     .msg.user { background: var(--vscode-input-background); }
     .muted { opacity: .7; font-size: 11px; margin-bottom: 4px; }
+    .tool-log { margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; border: 1px dashed var(--vscode-sideBar-border); font-size: 12px; }
+    .tool-log .tool-title { font-weight: 600; margin-bottom: 2px; }
+    .tool-log .tool-meta { opacity: .85; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -161,6 +183,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     <span>Model: <b id="model">-</b></span>
     <span>Thinking: <b id="thinking">-</b></span>
     <span>Msgs: <b id="msgCount">0</b></span>
+    <span>Tools: <b id="toolCount">0</b></span>
+    <span>Calls: <b id="toolCallCount">0</b></span>
   </div>
   <div class="toolbar">
     <button id="newSessionBtn">New</button>
@@ -181,7 +205,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     <div class="msg"><div class="muted">System</div>Start a conversation.</div>
   </div>
   <div class="input">
-    <textarea id="messageInput" placeholder="Ask Indusagi..."></textarea>
+    <textarea id="messageInput" placeholder="Ask Indusagi... (type / for commands)"></textarea>
+    <div id="slashMenu" class="slash-menu"></div>
     <div class="row">
       <button id="sendButton">Send</button>
       <button id="clearButton" class="secondary">Clear Chat</button>
@@ -198,10 +223,13 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       const model = $('model');
       const thinking = $('thinking');
       const msgCount = $('msgCount');
+      const toolCount = $('toolCount');
+      const toolCallCount = $('toolCallCount');
       const sessionSelect = $('sessionSelect');
       const nameSessionBtn = $('nameSessionBtn');
       const modelSelect = $('modelSelect');
       const thinkingSelect = $('thinkingSelect');
+      const slashMenu = $('slashMenu');
 
       function now() {
         return new Date().toISOString();
@@ -306,6 +334,9 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       let streamWrap = null;
       let streamBody = null;
       let streamText = '';
+      const seenTools = new Set();
+      let totalToolCalls = 0;
+      const toolRows = new Map();
 
       function addMsg(role, text) {
         const wrap = document.createElement('div');
@@ -335,6 +366,70 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         streamWrap = null;
         streamBody = null;
         streamText = '';
+      }
+
+      function resetToolStats() {
+        seenTools.clear();
+        totalToolCalls = 0;
+        toolRows.clear();
+        if (toolCount) toolCount.textContent = '0';
+        if (toolCallCount) toolCallCount.textContent = '0';
+      }
+
+      function recordToolEvent(toolName, phase) {
+        if (toolName) seenTools.add(String(toolName));
+        if (phase === 'start') totalToolCalls += 1;
+        if (toolCount) toolCount.textContent = String(seenTools.size);
+        if (toolCallCount) toolCallCount.textContent = String(totalToolCalls);
+      }
+
+      function ensureToolRow(toolCallId, toolName) {
+        const key = toolCallId || ('tool-' + Date.now() + '-' + Math.random());
+        if (toolRows.has(key)) return toolRows.get(key);
+        const row = document.createElement('div');
+        row.className = 'tool-log';
+        row.innerHTML = '<div class="tool-title">🔧 ' + (toolName || 'tool') + '</div><div class="tool-meta">starting...</div>';
+        chat.appendChild(row);
+        chat.scrollTop = chat.scrollHeight;
+        toolRows.set(key, row);
+        return row;
+      }
+
+      function extractToolText(payload) {
+        const blocks = payload?.content;
+        if (!Array.isArray(blocks)) return '';
+        return blocks
+          .map((b) => (b?.type === 'text' ? (b.text || '') : ''))
+          .filter(Boolean)
+          .join('\\n')
+          .trim();
+      }
+
+      function updateToolRow(evt) {
+        const toolName = evt.toolName || evt.tool || 'tool';
+        const key = evt.toolCallId || (toolName + '-latest');
+        const row = ensureToolRow(key, toolName);
+        const title = row.querySelector('.tool-title');
+        const meta = row.querySelector('.tool-meta');
+        const argsText = evt.args ? JSON.stringify(evt.args) : '';
+        const partialText = extractToolText(evt.partialResult);
+        const resultText = extractToolText(evt.result);
+
+        if (title) title.textContent = '🔧 ' + toolName + ' [' + (evt.phase || '?') + ']';
+        if (meta) {
+          if (evt.phase === 'start') {
+            meta.textContent = argsText ? ('args: ' + argsText) : 'started';
+          } else if (evt.phase === 'update') {
+            meta.textContent = partialText ? ('output: ' + partialText.slice(0, 500)) : 'running...';
+          } else if (evt.phase === 'end') {
+            if (evt.isError) {
+              meta.textContent = resultText ? ('error: ' + resultText.slice(0, 500)) : 'error';
+            } else {
+              meta.textContent = resultText ? ('done: ' + resultText.slice(0, 500)) : 'completed';
+            }
+          }
+        }
+        chat.scrollTop = chat.scrollHeight;
       }
 
       function extractMessageText(msg) {
@@ -377,6 +472,73 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           const role = roleFromMessage(m);
           const text = extractMessageText(m);
           if (text) addMsg(role, text);
+        });
+      }
+
+      const slashCommands = [
+        { cmd: '/help', desc: 'Show slash command help' },
+        { cmd: '/new', desc: 'Start new session' },
+        { cmd: '/clear', desc: 'Alias for /new' },
+        { cmd: '/state', desc: 'Refresh state' },
+        { cmd: '/session', desc: 'Show session stats summary' },
+        { cmd: '/sessions', desc: 'Refresh session history' },
+        { cmd: '/switch', desc: 'Switch session path' },
+        { cmd: '/name', desc: 'Name current session' },
+        { cmd: '/models', desc: 'Refresh model list' },
+        { cmd: '/model', desc: 'Set model: /model provider::modelId' },
+        { cmd: '/thinking', desc: 'Set thinking level' },
+        { cmd: '/compact', desc: 'Compact context' },
+        { cmd: '/stats', desc: 'Session stats' },
+        { cmd: '/export', desc: 'Export session HTML' },
+        { cmd: '/steer', desc: 'Steer running agent' },
+        { cmd: '/followup', desc: 'Queue follow-up message' },
+        { cmd: '/abort', desc: 'Abort current run' },
+        { cmd: '/bash', desc: 'Run bash command' },
+        { cmd: '/abort_bash', desc: 'Abort running bash' },
+        { cmd: '/auto_compact', desc: 'Auto compact on/off' },
+        { cmd: '/auto_retry', desc: 'Auto retry on/off' },
+        { cmd: '/abort_retry', desc: 'Abort retry' },
+        { cmd: '/last', desc: 'Show last assistant text' },
+        { cmd: '/copy', desc: 'Copy last assistant text' },
+        { cmd: '/settings', desc: 'CLI-only currently' },
+        { cmd: '/scoped-models', desc: 'CLI-only currently' },
+        { cmd: '/share', desc: 'CLI-only currently' },
+        { cmd: '/fork', desc: 'CLI-only currently' },
+        { cmd: '/tree', desc: 'CLI-only currently' },
+        { cmd: '/login', desc: 'CLI-only currently' },
+        { cmd: '/logout', desc: 'CLI-only currently' },
+        { cmd: '/resume', desc: 'CLI-only currently' },
+        { cmd: '/reload', desc: 'CLI-only currently' },
+        { cmd: '/changelog', desc: 'CLI-only currently' },
+        { cmd: '/hotkeys', desc: 'CLI-only currently' }
+      ];
+
+      function hideSlashMenu() {
+        if (slashMenu) slashMenu.style.display = 'none';
+      }
+
+      function renderSlashMenu(query) {
+        if (!slashMenu) return;
+        const q = (query || '').toLowerCase();
+        const filtered = slashCommands.filter((s) => s.cmd.includes(q));
+        if (!filtered.length) {
+          hideSlashMenu();
+          return;
+        }
+        slashMenu.innerHTML = filtered
+          .map((s) => '<div class="slash-item" data-cmd="' + s.cmd + '"><span class="slash-cmd">' + s.cmd + '</span><span class="slash-desc">' + s.desc + '</span></div>')
+          .join('');
+        slashMenu.style.display = 'block';
+
+        slashMenu.querySelectorAll('.slash-item').forEach((el) => {
+          el.addEventListener('click', () => {
+            const cmd = el.getAttribute('data-cmd') || '';
+            if (input) {
+              input.value = cmd + ' ';
+              input.focus();
+            }
+            hideSlashMenu();
+          });
         });
       }
 
@@ -465,10 +627,23 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         postToExtension('clearChat');
       });
 
+      input?.addEventListener('input', () => {
+        const v = (input.value || '').trimStart();
+        if (v.startsWith('/')) {
+          renderSlashMenu(v);
+        } else {
+          hideSlashMenu();
+        }
+      });
+
       input?.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+          hideSlashMenu();
+        }
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
           send();
+          hideSlashMenu();
         }
       });
 
@@ -503,6 +678,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         if (m.type === 'clearChat') {
           chat.innerHTML = '';
           resetStream();
+          resetToolStats();
           console.log('[indusagi-webview][' + now() + '] chat cleared from extension');
           return;
         }
@@ -527,7 +703,21 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
         if (m.type === 'replaceMessages') {
           replaceMessages(m.messages || []);
+          resetToolStats();
           console.log('[indusagi-webview][' + now() + '] replaced chat messages. count=', (m.messages || []).length);
+          return;
+        }
+
+        if (m.type === 'toolEvent') {
+          recordToolEvent(m.toolName || m.tool, m.phase);
+          updateToolRow(m);
+          console.log('[indusagi-webview][' + now() + '] tool event', {
+            phase: m.phase,
+            tool: m.toolName || m.tool,
+            toolCallId: m.toolCallId,
+            toolsSeen: seenTools.size,
+            totalCalls: totalToolCalls,
+          });
           return;
         }
 
@@ -555,6 +745,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         }
       });
 
+      resetToolStats();
       postToExtension('getModels');
       postToExtension('getThinkingOptions');
       postToExtension('getSessionHistory');
