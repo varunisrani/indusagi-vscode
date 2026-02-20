@@ -172,9 +172,20 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     .msg { margin-bottom: 10px; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--vscode-sideBar-border); }
     .msg.user { background: var(--vscode-input-background); }
     .muted { opacity: .7; font-size: 11px; margin-bottom: 4px; }
-    .tool-log { margin-bottom: 8px; padding: 6px 8px; border-radius: 6px; border: 1px dashed var(--vscode-sideBar-border); font-size: 12px; }
+    .tool-log { margin-bottom: 8px; border-radius: 6px; border: 1px dashed var(--vscode-sideBar-border); font-size: 12px; overflow: hidden; }
+    .tool-log .tool-head { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:6px 8px; background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background)); cursor:pointer; }
     .tool-log .tool-title { font-weight: 600; margin-bottom: 2px; }
     .tool-log .tool-meta { opacity: .85; font-size: 11px; }
+    .tool-log .tool-chip { font-size: 10px; border-radius: 10px; padding: 2px 6px; border: 1px solid var(--vscode-sideBar-border); }
+    .tool-log .chip-start { color:#4ea1ff; }
+    .tool-log .chip-update { color:#e2b93d; }
+    .tool-log .chip-end { color:#4caf50; }
+    .tool-log .chip-error { color:#e85d75; }
+    .tool-log .tool-body { display:none; padding:6px 8px; border-top:1px solid var(--vscode-sideBar-border); }
+    .tool-log.expanded .tool-body { display:block; }
+    .tool-log pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow:auto; }
+    .tool-actions { display:flex; gap:8px; margin-top:6px; }
+    .tool-actions button { padding: 3px 8px; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -388,7 +399,44 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         if (toolRows.has(key)) return toolRows.get(key);
         const row = document.createElement('div');
         row.className = 'tool-log';
-        row.innerHTML = '<div class="tool-title">🔧 ' + (toolName || 'tool') + '</div><div class="tool-meta">starting...</div>';
+        row.innerHTML = '' +
+          '<div class="tool-head">' +
+            '<div>' +
+              '<div class="tool-title">🔧 ' + (toolName || 'tool') + '</div>' +
+              '<div class="tool-meta">starting...</div>' +
+            '</div>' +
+            '<span class="tool-chip chip-start">start</span>' +
+          '</div>' +
+          '<div class="tool-body">' +
+            '<div class="tool-details"></div>' +
+            '<pre class="tool-output"></pre>' +
+            '<div class="tool-actions">' +
+              '<button class="tool-toggle">Show more</button>' +
+              '<button class="tool-copy">Copy</button>' +
+            '</div>' +
+          '</div>';
+
+        const head = row.querySelector('.tool-head');
+        head?.addEventListener('click', () => row.classList.toggle('expanded'));
+
+        const toggleBtn = row.querySelector('.tool-toggle');
+        toggleBtn?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          row.classList.toggle('expanded');
+          toggleBtn.textContent = row.classList.contains('expanded') ? 'Show less' : 'Show more';
+          const outputEl = row.querySelector('.tool-output');
+          const full = row.getAttribute('data-full-output') || '';
+          outputEl.textContent = row.classList.contains('expanded') ? full : (full.length > 500 ? full.slice(0, 500) + ' …' : full);
+        });
+
+        const copyBtn = row.querySelector('.tool-copy');
+        copyBtn?.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const outputEl = row.querySelector('.tool-output');
+          const text = outputEl ? (outputEl.textContent || '') : '';
+          await navigator.clipboard.writeText(text);
+        });
+
         chat.appendChild(row);
         chat.scrollTop = chat.scrollHeight;
         toolRows.set(key, row);
@@ -405,30 +453,95 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
           .trim();
       }
 
+      function statusClass(phase, isError) {
+        if (isError) return 'chip-error';
+        if (phase === 'start') return 'chip-start';
+        if (phase === 'update') return 'chip-update';
+        return 'chip-end';
+      }
+
+      function summarizeTodoWrite(args) {
+        const todos = Array.isArray(args?.todos) ? args.todos : [];
+        if (!todos.length) return 'updated todo list';
+        const done = todos.filter((t) => t?.status === 'completed').length;
+        const inProgress = todos.filter((t) => t?.status === 'in_progress').length;
+        const pending = todos.filter((t) => t?.status === 'pending').length;
+        const titles = todos.slice(0, 3).map((t) => '- ' + (t?.content || 'item')).join(' | ');
+        return 'todos: ' + done + ' done, ' + inProgress + ' in-progress, ' + pending + ' pending' + (titles ? (' | ' + titles) : '');
+      }
+
+      function toolTime() {
+        return new Date().toLocaleTimeString();
+      }
+
+      function summarizeArgsLine(toolName, args) {
+        if (!args) return '';
+        if (toolName === 'bash' && args.command) return 'cmd: ' + args.command;
+        if ((toolName === 'read' || toolName === 'write' || toolName === 'edit') && args.path) return 'path: ' + args.path;
+        if (toolName === 'task' && args.description) return 'task: ' + args.description;
+        if (toolName === 'todoread') return 'todo read';
+        if (toolName === 'todowrite') return summarizeTodoWrite(args);
+        return JSON.stringify(args).slice(0, 180);
+      }
+
+      function summarizeToolEvent(evt, fullOutput) {
+        const toolName = evt.toolName || evt.tool || 'tool';
+        const prefix = '[' + toolTime() + '] ';
+        if (evt.phase === 'start') {
+          const argsLine = summarizeArgsLine(toolName, evt.args);
+          if (toolName === 'todoread') return prefix + 'reading todo list...';
+          if (toolName === 'todowrite') return prefix + summarizeTodoWrite(evt.args || {});
+          if (toolName === 'bash') return prefix + 'running shell command' + (argsLine ? ' | ' + argsLine : '...');
+          if (toolName === 'read') return prefix + 'reading file' + (argsLine ? ' | ' + argsLine : '...');
+          if (toolName === 'edit') return prefix + 'editing file' + (argsLine ? ' | ' + argsLine : '...');
+          if (toolName === 'write') return prefix + 'writing file' + (argsLine ? ' | ' + argsLine : '...');
+          return prefix + 'started' + (argsLine ? ' | ' + argsLine : '');
+        }
+        if (evt.phase === 'update') return prefix + 'running...';
+        if (evt.isError) return prefix + 'failed';
+        if (toolName === 'todoread' && fullOutput) return prefix + 'todo list loaded';
+        if (toolName === 'todowrite' && (evt.args?.todos || fullOutput)) return prefix + summarizeTodoWrite(evt.args || {});
+        return prefix + 'completed';
+      }
+
       function updateToolRow(evt) {
         const toolName = evt.toolName || evt.tool || 'tool';
         const key = evt.toolCallId || (toolName + '-latest');
         const row = ensureToolRow(key, toolName);
         const title = row.querySelector('.tool-title');
         const meta = row.querySelector('.tool-meta');
-        const argsText = evt.args ? JSON.stringify(evt.args) : '';
+        const chip = row.querySelector('.tool-chip');
+        const details = row.querySelector('.tool-details');
+        const outputEl = row.querySelector('.tool-output');
+
+        const argsText = summarizeArgsLine(toolName, evt.args);
         const partialText = extractToolText(evt.partialResult);
         const resultText = extractToolText(evt.result);
+        const fullOutput = resultText || partialText || '';
+        const shortOutput = fullOutput.length > 500 ? (fullOutput.slice(0, 500) + ' …') : fullOutput;
+        row.setAttribute('data-full-output', fullOutput);
 
-        if (title) title.textContent = '🔧 ' + toolName + ' [' + (evt.phase || '?') + ']';
-        if (meta) {
-          if (evt.phase === 'start') {
-            meta.textContent = argsText ? ('args: ' + argsText) : 'started';
-          } else if (evt.phase === 'update') {
-            meta.textContent = partialText ? ('output: ' + partialText.slice(0, 500)) : 'running...';
-          } else if (evt.phase === 'end') {
-            if (evt.isError) {
-              meta.textContent = resultText ? ('error: ' + resultText.slice(0, 500)) : 'error';
-            } else {
-              meta.textContent = resultText ? ('done: ' + resultText.slice(0, 500)) : 'completed';
-            }
-          }
+        if (title) title.textContent = '🔧 ' + toolName;
+        if (chip) {
+          chip.className = 'tool-chip ' + statusClass(evt.phase, evt.isError);
+          chip.textContent = evt.isError ? 'error' : (evt.phase || '?');
         }
+        if (meta) {
+          meta.textContent = summarizeToolEvent(evt, fullOutput);
+        }
+        if (details) {
+          details.textContent = argsText ? ('details: ' + argsText) : '';
+        }
+        if (outputEl) {
+          outputEl.textContent = row.classList.contains('expanded') ? fullOutput : shortOutput;
+        }
+
+        const toggleBtn = row.querySelector('.tool-toggle');
+        if (toggleBtn) {
+          toggleBtn.textContent = row.classList.contains('expanded') ? 'Show less' : 'Show more';
+          toggleBtn.style.display = fullOutput.length > 500 ? 'inline-block' : 'none';
+        }
+
         chat.scrollTop = chat.scrollHeight;
       }
 
