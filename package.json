@@ -22,28 +22,91 @@
         "category": "Indusagi"
       },
       {
+        "command": "indusagi.chat",
+        "title": "Chat with Indusagi",
+        "category": "Indusagi"
+      },
+      {
         "command": "indusagi.clear",
         "title": "Clear Context",
         "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.activate",
+        "title": "Start Indusagi",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.newSession",
+        "title": "New Session",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.getState",
+        "title": "Get Session State",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.cycleModel",
+        "title": "Cycle Model",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.cycleThinking",
+        "title": "Cycle Thinking Level",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.getStats",
+        "title": "Get Session Stats",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.exportHtml",
+        "title": "Export to HTML",
+        "category": "Indusagi"
+      },
+      {
+        "command": "indusagi.compact",
+        "title": "Compact Session",
+        "category": "Indusagi"
       }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "indusagi-sidebar",
+          "title": "Indusagi AI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "indusagi-sidebar": [
+        {
+          "type": "webview",
+          "id": "indusagi.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
     "configuration": {
       "title": "Indusagi Settings",
       "properties": {
-        "indusagiPath": {
+        "indusagi-vscode.indusagiPath": {
           "type": "string",
           "default": "indusagi",
           "description": "Path to indusagi CLI binary",
           "order": 1
         },
-        "apiKey": {
+        "indusagi-vscode.apiKey": {
           "type": "string",
           "default": "",
           "description": "OpenAI API key (optional, set via indusagi login)",
           "order": 2,
           "password": true
         },
-        "model": {
+        "indusagi-vscode.model": {
           "type": "string",
           "default": "gpt-4o-mini",
           "description": "Model to use",
@@ -53,9 +116,9 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "tsc -p",
-    "compile": "tsc -p",
-    "watch": "tsc -p -watch",
+    "vscode:prepublish": "tsc -p tsconfig.json",
+    "compile": "tsc -p tsconfig.json",
+    "watch": "tsc -p -watch tsconfig.json",
     "package": "vsce package",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext .ts",
@@ -63,7 +126,8 @@
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
-    "@types/vscode": "^1.0.0"
+    "@types/vscode": "^1.0.0",
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.0-next"

@@ -1,96 +1,46 @@
 import * as vscode from "vscode";
 import { spawn } from "child_process";
-import * as path from "path";
+import { SidebarProvider } from "./sidebarProvider";
 
-// Extension configuration
 let outputChannel: vscode.OutputChannel;
 let indusagiProcess: ReturnType<typeof spawn> | null = null;
-const config = vscode.workspace.getConfiguration("indusagi-vscode");
+let config = vscode.workspace.getConfiguration("indusagi-vscode");
+let sidebarProvider: SidebarProvider;
 
-// Indusagi RPC protocol implementation
 class IndusagiRPC {
   private messageId = 0;
+  private pendingRequests = new Map<string, { resolve: (value: any) => void; reject: (error: any) => void }>();
+  private responseBuffer = "";
+  private isReady = false;
+  private currentStreamText = "";
+  private currentState: any = null;
+  public onStateChanged?: (state: any) => void;
 
   async sendRequest<T>(command: string, params: object = {}): Promise<T> {
     return new Promise((resolve, reject) => {
-      const id = ++this.messageId;
+      const id = `req-${++this.messageId}`;
+      this.pendingRequests.set(id, { resolve, reject });
+
       const request = {
         type: command,
-        id: `req-${id}`,
+        id,
         ...params,
       };
 
-      try {
-        const result = await this.executeCommand(command, request);
-        resolve(result as T);
-      } catch (error) {
-        reject(error);
+      this.ensureIndusagiRunning();
+      if (indusagiProcess?.stdin) {
+        indusagiProcess.stdin.write(JSON.stringify(request) + "\n");
+        outputChannel.appendLine(`→ Sent: ${JSON.stringify(request)}`);
+      } else {
+        reject(new Error("Indusagi process not available"));
       }
     });
   }
 
-  private async executeCommand(command: string, request: any): Promise<any> {
-    return new Promise((resolve, reject) => {
-      if (!indusagiProcess || indusagiProcess.killed) {
-        // Start Indusagi if not running
-        this.startIndusagi();
-        // Wait for it to be ready
-        await new Promise(r => setTimeout(r, 500));
-      }
-
-      // Send request to Indusagi
-      indusagiProcess.stdin.write(JSON.stringify(request) + "\n");
-
-      // Read response line by line
-      let response: any;
-      let buffer = "";
-
-      const responseHandler = (data: string) => {
-        buffer += data;
-        const lines = buffer.split("\n");
-
-        for (const line of lines) {
-          if (line.trim()) {
-            try {
-              response = JSON.parse(line);
-
-              // Check if this is our response
-              if (response.id === (request as any).id) {
-                indusagiProcess.stdin.destroy();
-                resolve(response);
-                indusagiProcess.removeAllListeners("data");
-                return;
-              }
-            } catch {
-              // Not JSON or not our response, continue
-            }
-          }
-        }
-      };
-
-      indusagiProcess.stdout.on("data", responseHandler);
-      indusagiProcess.stdout.on("end", () => {
-        // Flush remaining buffer
-        if (buffer.trim()) {
-          try {
-            const response = JSON.parse(buffer);
-            if (response.id === (request as any).id) {
-              resolve(response);
-              indusagiProcess.stdin.destroy();
-              return;
-            }
-          } catch {
-            reject(new Error("Invalid response format"));
-          }
-        }
-      });
-
-      // Timeout handling
-      const timeout = setTimeout(() => {
-        indusagiProcess.stdin.destroy();
-        reject(new Error("Request timeout"));
-      }, 30000); // 30 seconds
-    });
+  private ensureIndusagiRunning() {
+    if (!indusagiProcess || indusagiProcess.killed) {
+      this.startIndusagi();
+    }
   }
 
   private startIndusagi() {
@@ -98,22 +48,12 @@ class IndusagiRPC {
     
     outputChannel.appendLine(`Starting Indusagi: ${indusagiPath}`);
     
-    // Get API key if provided
-    const apiKey = config.get<string>("apiKey", "");
-    
     const args = [
-      "indusagi",
       "--mode", "rpc",
-      "--no-session",
     ];
 
-    if (apiKey) {
-      // Set via environment variable
-      args.push("--provider", "openai", "--model", config.get<string>("model", "gpt-4o-mini"));
-    }
-
     indusagiProcess = spawn(indusagiPath, args, {
-      stdio: ["pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
 
     indusagiProcess.on("error", (error) => {
@@ -121,56 +61,286 @@ class IndusagiRPC {
       vscode.window.showErrorMessage(`Indusagi error: ${error.message}`);
     });
 
-    // Wait for agent_start event to indicate ready state
-    indusagiProcess.stdout.on("data", (data) => {
-      const lines = data.toString().split("\n");
-      for (const line of lines) {
-        if (line.trim()) {
-          try {
-            const event = JSON.parse(line);
-            if (event.type === "agent_start") {
-              outputChannel.appendLine("Indusagi RPC connected and ready");
-              break;
-            }
-          } catch {
-            // Ignore non-JSON lines
-          }
-        }
-      }
+    indusagiProcess.stderr?.on("data", (data) => {
+      outputChannel.appendLine(`Indusagi stderr: ${data.toString()}`);
+    });
+
+    indusagiProcess.stdout?.on("data", (data) => {
+      this.handleResponse(data.toString());
     });
   }
 
-  private stopIndusagi() {
+  private handleResponse(data: string) {
+    this.responseBuffer += data;
+    const lines = this.responseBuffer.split("\n");
+    
+    // Keep last incomplete line in buffer
+    this.responseBuffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const response = JSON.parse(line);
+          outputChannel.appendLine(`← Received: ${JSON.stringify(response).substring(0, 200)}...`);
+          
+          if (response.type === "agent_start") {
+            this.isReady = true;
+            outputChannel.appendLine("Indusagi RPC connected and ready");
+            // Request initial state
+            this.getState().then(state => {
+              this.currentState = state;
+              sidebarProvider?.sendMessageToWebview({
+                type: "stateUpdate",
+                state: state
+              });
+              this.onStateChanged?.(state);
+            }).catch(() => {});
+            continue;
+          }
+
+          // Handle state updates
+          if (response.type === "state_update") {
+            this.currentState = response.state;
+            sidebarProvider?.sendMessageToWebview({
+              type: "stateUpdate",
+              state: response.state
+            });
+            this.onStateChanged?.(response.state);
+            continue;
+          }
+
+          // Handle streaming responses
+          if (response.type === "message_update") {
+            const event = response.assistantMessageEvent;
+            if (event?.type === "text_delta") {
+              this.currentStreamText += event.delta || "";
+              // Send to sidebar
+              sidebarProvider?.sendMessageToWebview({
+                type: "streamChunk",
+                content: event.delta || "",
+                model: this.currentState?.model
+              });
+            } else if (event?.type === "reasoning_delta") {
+              // Handle reasoning if needed
+              outputChannel.appendLine(`Reasoning: ${event.delta?.substring(0, 100)}...`);
+            }
+            continue;
+          }
+
+          if (response.type === "message_end") {
+            // Send complete message to sidebar
+            if (this.currentStreamText) {
+              sidebarProvider?.sendMessageToWebview({
+                type: "addMessage",
+                content: this.currentStreamText,
+                model: this.currentState?.model
+              });
+              this.currentStreamText = "";
+            }
+          }
+
+          // Handle tool execution events
+          if (response.type === "tool_execution_start") {
+            sidebarProvider?.sendMessageToWebview({
+              type: "toolExecution",
+              tool: response.tool,
+              args: response.args
+            });
+          }
+
+          // Handle regular responses
+          const pending = this.pendingRequests.get(response.id);
+          if (pending) {
+            this.pendingRequests.delete(response.id);
+            if (response.error) {
+              pending.reject(new Error(response.error));
+            } else {
+              pending.resolve(response);
+            }
+          }
+        } catch (e) {
+          outputChannel.appendLine(`Parse error: ${e}`);
+        }
+      }
+    }
+  }
+
+  stop() {
     if (indusagiProcess && !indusagiProcess.killed) {
       indusagiProcess.kill("SIGTERM");
       indusagiProcess = null;
+      this.isReady = false;
       outputChannel.appendLine("Indusagi stopped");
     }
   }
 
-  // Clean up on deactivation
-  context.subscriptions.push(
-    vscode.Disposable.from(context.subscriptions),
-  );
+  private unwrapData<T>(response: any): T {
+    return (response && typeof response === "object" && "data" in response)
+      ? (response.data as T)
+      : (response as T);
+  }
 
-  context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(() => {
-      // Update context based on selected file
-      const editor = vscode.window.activeTextEditor;
-      if (editor) {
-        outputChannel.appendLine(`Active editor: ${editor.document.fileName}`);
+  // Session management methods
+  async getState(): Promise<any> {
+    const res = await this.sendRequest("get_state", {});
+    return this.unwrapData<any>(res);
+  }
+
+  async getMessages(): Promise<any[]> {
+    const res = await this.sendRequest("get_messages", {});
+    const data = this.unwrapData<any>(res);
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.messages)) return data.messages;
+    return [];
+  }
+
+  async newSession(): Promise<void> {
+    await this.sendRequest("new_session", {});
+  }
+
+  async switchSession(sessionPath: string): Promise<void> {
+    await this.sendRequest("switch_session", { sessionPath });
+  }
+
+  async getAvailableModels(): Promise<any[]> {
+    const res = await this.sendRequest("get_available_models", {});
+    const data = this.unwrapData<any>(res);
+    if (Array.isArray(data)) return data;
+    if (Array.isArray(data?.models)) return data.models;
+    return [];
+  }
+
+  async setModel(model: string | { provider?: string; modelId?: string; id?: string }): Promise<void> {
+    if (!model) return;
+
+    if (typeof model === "string") {
+      // expected encoded format: provider::modelId
+      const [provider, modelId] = model.split("::");
+      if (provider && modelId) {
+        await this.sendRequest("set_model", { provider, modelId });
+        return;
       }
-    })
+      // fallback: assume model string is id only, provider unknown
+      throw new Error("Invalid model format. Expected provider::modelId");
+    }
+
+    const provider = model.provider;
+    const modelId = model.modelId || model.id;
+    if (!provider || !modelId) {
+      throw new Error("Invalid model object. Missing provider/modelId");
+    }
+
+    await this.sendRequest("set_model", { provider, modelId });
+  }
+
+  async cycleModel(): Promise<void> {
+    await this.sendRequest("cycle_model", {});
+  }
+
+  async setThinkingLevel(level: string): Promise<void> {
+    await this.sendRequest("set_thinking_level", { level });
+  }
+
+  async cycleThinkingLevel(): Promise<void> {
+    await this.sendRequest("cycle_thinking_level", {});
+  }
+
+  async getSessionStats(): Promise<any> {
+    const res = await this.sendRequest("get_session_stats", {});
+    return this.unwrapData<any>(res);
+  }
+
+  async exportHtml(): Promise<string> {
+    const res = await this.sendRequest("export_html", {});
+    const data = this.unwrapData<any>(res);
+    return typeof data === "string" ? data : data?.path ?? "";
+  }
+
+  async compact(): Promise<void> {
+    await this.sendRequest("compact", {});
+  }
+
+  async setAutoCompaction(enabled: boolean): Promise<void> {
+    await this.sendRequest("set_auto_compaction", { enabled });
+  }
+
+  getCurrentState(): any {
+    return this.currentState;
+  }
+}
+
+const rpc = new IndusagiRPC();
+
+function formatModelLabel(model: any): string {
+  if (!model) return "unknown";
+  if (typeof model === "string") return model;
+  return model.id || model.name || model.model || JSON.stringify(model);
+}
+
+function formatThinkingLabel(level: any): string {
+  if (!level) return "unknown";
+  if (typeof level === "string") return level;
+  return level.level || level.name || JSON.stringify(level);
+}
+
+export function activate(context: vscode.ExtensionContext) {
+  outputChannel = vscode.window.createOutputChannel("Indusagi");
+  context.subscriptions.push(outputChannel);
+  outputChannel.appendLine("Indusagi extension activated");
+
+  // Initialize sidebar provider
+  sidebarProvider = new SidebarProvider(context.extensionUri);
+
+  const SESSION_HISTORY_KEY = "indusagi.sessionHistory";
+  const SESSION_ALIAS_KEY = "indusagi.sessionAliases";
+  const MAX_SESSIONS = 50;
+
+  const getSessionHistory = (): string[] => context.globalState.get<string[]>(SESSION_HISTORY_KEY, []);
+  const getSessionAliases = (): Record<string, string> => context.globalState.get<Record<string, string>>(SESSION_ALIAS_KEY, {});
+
+  const pushSessionToHistory = async (sessionFile?: string) => {
+    if (!sessionFile) return;
+    const current = getSessionHistory().filter((p) => p !== sessionFile);
+    current.unshift(sessionFile);
+    await context.globalState.update(SESSION_HISTORY_KEY, current.slice(0, MAX_SESSIONS));
+  };
+
+  const sendSessionHistoryToWebview = async (stateOverride?: any) => {
+    const history = getSessionHistory();
+    const aliases = getSessionAliases();
+    const currentState = stateOverride ?? (await rpc.getState().catch(() => null));
+    sidebarProvider.sendMessageToWebview({
+      type: "sessionHistory",
+      sessions: history.map((path) => ({ path, name: aliases[path] || path.split("/").pop() || path })),
+      currentSession: currentState?.sessionFile,
+    });
+  };
+
+  rpc.onStateChanged = async (state: any) => {
+    await pushSessionToHistory(state?.sessionFile);
+    await sendSessionHistoryToWebview(state);
+  };
+
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(
+      SidebarProvider.viewType,
+      sidebarProvider
+    )
   );
 
-  // Register commands
+  // Register ask command (original)
   const askCommand = vscode.commands.registerCommand("indusagi.ask", async () => {
     const editor = vscode.window.activeTextEditor;
-    const selection = editor?.selection;
+    if (!editor) {
+      vscode.window.showWarningMessage("No editor open");
+      return;
+    }
+
+    const selection = editor.selection;
     const selectedText = editor.document.getText(selection) || editor.document.getText();
 
     if (!selectedText) {
-      vscode.window.showWarningMessage("No text selected. Please select code first.");
+      vscode.window.showWarningMessage("No text selected");
       return;
     }
 
@@ -179,57 +349,325 @@ class IndusagiRPC {
     try {
       const result = await rpc.sendRequest("prompt", {
         message: selectedText,
+        streamingBehavior: "followUp",
       });
-
-      // Show response in output channel
-      if (result.type === "response" && result.command === "prompt") {
-        outputChannel.appendLine("✅ Request sent");
-      }
-
-    } catch (error) {
-      vscode.window.showErrorMessage(`Failed to ask Indusagi: ${error.message}`);
-      outputChannel.appendLine(`❌ Error: ${error.message}`);
+      outputChannel.appendLine("Response: " + JSON.stringify(result));
+      vscode.window.showInformationMessage("Request sent to Indusagi");
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed: ${error.message}`);
+      outputChannel.appendLine(`Error: ${error.message}`);
     }
   });
 
+  // Register chat command (for sidebar)
+  const chatCommand = vscode.commands.registerCommand("indusagi.chat", async (message?: string) => {
+    const editor = vscode.window.activeTextEditor;
+    let codeContext = "";
+    
+    if (editor) {
+      const selection = editor.selection;
+      codeContext = editor.document.getText(selection) || "";
+    }
+
+    let userMessage = message;
+    
+    // If no message provided, prompt for input
+    if (!userMessage) {
+      userMessage = await vscode.window.showInputBox({
+        prompt: "Ask Indusagi",
+        placeHolder: "Type your question here..."
+      });
+    }
+
+    if (!userMessage) {
+      return;
+    }
+
+    // Include selected code if available
+    const fullMessage = codeContext 
+      ? `${userMessage}\n\nSelected code:\n\`\`\`\n${codeContext}\n\`\`\``
+      : userMessage;
+
+    outputChannel.appendLine(`Chat message: ${fullMessage.substring(0, 100)}...`);
+
+    try {
+      // Send to Indusagi
+      await rpc.sendRequest("prompt", {
+        message: fullMessage,
+        streamingBehavior: "followUp",
+      });
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed: ${error.message}`);
+      outputChannel.appendLine(`Error: ${error.message}`);
+      sidebarProvider.sendMessageToWebview({
+        type: "addMessage",
+        content: `❌ Error: ${error.message}`
+      });
+    }
+  });
+
+  // Register clear command
   const clearCommand = vscode.commands.registerCommand("indusagi.clear", () => {
-    stopIndusagi();
-    outputChannel.appendLine("Indusagi context cleared");
+    rpc.stop();
+    sidebarProvider.sendMessageToWebview({ type: "clearChat" });
     vscode.window.showInformationMessage("Indusagi context cleared");
   });
 
-  // Configuration
-  const configDisposable = vscode.workspace.onDidChangeConfiguration((e) => {
-    outputChannel.appendLine("Configuration changed");
-  });
-
-  // Activate command
-  vscode.commands.registerCommand("indusagi.activate", () => {
-    startIndusagi();
+  // Register activate command
+  const activateCommand = vscode.commands.registerCommand("indusagi.activate", () => {
+    outputChannel.appendLine("Starting Indusagi manually");
     vscode.window.showInformationMessage("Indusagi started");
   });
 
-  function activate(context: vscode.ExtensionContext) {
-    outputChannel = vscode.window.createOutputChannel("Indusagi");
-    context.subscriptions.push(outputChannel);
-    outputChannel.appendLine("Indusagi extension activated");
-    
-    // Auto-start Indusagi on activation
-    startIndusagi();
+  // Session management commands
+  const newSessionCommand = vscode.commands.registerCommand("indusagi.newSession", async () => {
+    try {
+      await rpc.newSession();
+      const [state, messages] = await Promise.all([
+        rpc.getState().catch(() => null),
+        rpc.getMessages().catch(() => []),
+      ]);
+      if (state?.sessionFile) {
+        await pushSessionToHistory(state.sessionFile);
+      }
+      sidebarProvider.sendMessageToWebview({ type: "clearChat" });
+      sidebarProvider.sendMessageToWebview({ type: "replaceMessages", messages });
+      if (state) {
+        sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      }
+      await sendSessionHistoryToWebview(state);
+      vscode.window.showInformationMessage("New session started");
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to start new session: ${error.message}`);
+    }
+  });
 
-    vscode.window.showInformationMessage("Indusagi VS Code extension is ready!");
-  }
+  const getSessionHistoryCommand = vscode.commands.registerCommand("indusagi.getSessionHistory", async () => {
+    await sendSessionHistoryToWebview();
+  });
 
-  function deactivate() {
-    stopIndusagi();
-  outputChannel.appendLine("Indusagi extension deactivated");
-  }
-}
+  const switchSessionCommand = vscode.commands.registerCommand("indusagi.switchSession", async (sessionPath: string) => {
+    if (!sessionPath) return;
+    try {
+      await rpc.switchSession(sessionPath);
+      const [state, messages] = await Promise.all([
+        rpc.getState().catch(() => null),
+        rpc.getMessages().catch(() => []),
+      ]);
+      if (state?.sessionFile) {
+        await pushSessionToHistory(state.sessionFile);
+      }
+      sidebarProvider.sendMessageToWebview({ type: "clearChat" });
+      sidebarProvider.sendMessageToWebview({ type: "replaceMessages", messages });
+      if (state) {
+        sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      }
+      await sendSessionHistoryToWebview(state);
+      vscode.window.showInformationMessage(`Switched session: ${sessionPath.split('/').pop()}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to switch session: ${error.message}`);
+    }
+  });
 
-export function activate(context: vscode.ExtensionContext) {
-  activate(context);
+  const setSessionAliasCommand = vscode.commands.registerCommand("indusagi.setSessionAlias", async (payload: { path: string; alias: string }) => {
+    const path = payload?.path;
+    const alias = (payload?.alias || "").trim();
+    if (!path) return;
+    const aliases = getSessionAliases();
+    if (!alias) {
+      delete aliases[path];
+    } else {
+      aliases[path] = alias;
+    }
+    await context.globalState.update(SESSION_ALIAS_KEY, aliases);
+    await sendSessionHistoryToWebview();
+  });
+
+  const getStateCommand = vscode.commands.registerCommand("indusagi.getState", async () => {
+    try {
+      const state = await rpc.getState();
+      vscode.window.showInformationMessage(`Model: ${formatModelLabel(state?.model)}, Messages: ${state?.messageCount || 0}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to get state: ${error.message}`);
+    }
+  });
+
+  const cycleModelCommand = vscode.commands.registerCommand("indusagi.cycleModel", async () => {
+    try {
+      await rpc.cycleModel();
+      const [state, models] = await Promise.all([
+        rpc.getState(),
+        rpc.getAvailableModels().catch(() => []),
+      ]);
+      sidebarProvider.sendMessageToWebview({
+        type: "modelsList",
+        models,
+        currentModel: state?.model,
+      });
+      vscode.window.showInformationMessage(`Switched to model: ${formatModelLabel(state?.model)}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to cycle model: ${error.message}`);
+    }
+  });
+
+  const getModelsCommand = vscode.commands.registerCommand("indusagi.getModels", async () => {
+    try {
+      const [models, state] = await Promise.all([
+        rpc.getAvailableModels(),
+        rpc.getState().catch(() => null),
+      ]);
+      sidebarProvider.sendMessageToWebview({
+        type: "modelsList",
+        models,
+        currentModel: state?.model,
+      });
+    } catch (error: any) {
+      outputChannel.appendLine(`Failed to get models: ${error.message}`);
+    }
+  });
+
+  const setModelCommand = vscode.commands.registerCommand("indusagi.setModel", async (model: string) => {
+    if (!model) return;
+    try {
+      await rpc.setModel(model);
+      const state = await rpc.getState();
+      sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      vscode.window.showInformationMessage(`Switched to model: ${formatModelLabel(state?.model)}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to set model: ${error.message}`);
+    }
+  });
+
+  const cycleThinkingCommand = vscode.commands.registerCommand("indusagi.cycleThinking", async () => {
+    try {
+      await rpc.cycleThinkingLevel();
+      const state = await rpc.getState();
+      sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      vscode.window.showInformationMessage(`Thinking level: ${formatThinkingLabel(state?.thinkingLevel)}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to cycle thinking level: ${error.message}`);
+    }
+  });
+
+  const getThinkingOptionsCommand = vscode.commands.registerCommand("indusagi.getThinkingOptions", async () => {
+    try {
+      const state = await rpc.getState();
+      const levels = ["off", "minimal", "low", "medium", "high", "xhigh"];
+      sidebarProvider.sendMessageToWebview({
+        type: "thinkingOptions",
+        levels,
+        currentLevel: state?.thinkingLevel,
+      });
+    } catch (error: any) {
+      outputChannel.appendLine(`Failed to get thinking options: ${error.message}`);
+    }
+  });
+
+  const setThinkingCommand = vscode.commands.registerCommand("indusagi.setThinking", async (level: string) => {
+    if (!level) return;
+    try {
+      await rpc.setThinkingLevel(level);
+      const state = await rpc.getState();
+      sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      vscode.window.showInformationMessage(`Thinking level: ${formatThinkingLabel(state?.thinkingLevel)}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to set thinking level: ${error.message}`);
+    }
+  });
+
+  const getStatsCommand = vscode.commands.registerCommand("indusagi.getStats", async () => {
+    try {
+      const stats = await rpc.getSessionStats();
+      const totalTokens = stats?.tokens?.total ?? 0;
+      const cost = stats?.cost ?? 0;
+      const totalMessages = stats?.totalMessages ?? stats?.messageCount ?? 0;
+      const message = `Tokens: ${totalTokens}, Cost: $${Number(cost).toFixed(4)}, Messages: ${totalMessages}`;
+      vscode.window.showInformationMessage(message);
+      outputChannel.appendLine(`[stats] ${message}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to get stats: ${error.message}`);
+    }
+  });
+
+  const exportHtmlCommand = vscode.commands.registerCommand("indusagi.exportHtml", async () => {
+    try {
+      const htmlPath = await rpc.exportHtml();
+      if (!htmlPath) {
+        vscode.window.showWarningMessage("Export completed but no file path was returned.");
+        return;
+      }
+      const result = await vscode.window.showInformationMessage(`Exported to: ${htmlPath}`, "Open");
+      if (result === "Open") {
+        const uri = vscode.Uri.file(htmlPath);
+        await vscode.env.openExternal(uri);
+      }
+      outputChannel.appendLine(`[export] ${htmlPath}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to export: ${error.message}`);
+    }
+  });
+
+  const compactCommand = vscode.commands.registerCommand("indusagi.compact", async () => {
+    try {
+      const result: any = await rpc.sendRequest("compact", {});
+      const data = result?.data ?? {};
+      const tokensBefore = data?.tokensBefore;
+      const summary = data?.summary;
+      const state = await rpc.getState().catch(() => null);
+      if (state) {
+        sidebarProvider.sendMessageToWebview({ type: "stateUpdate", state });
+      }
+      const compactMsg = tokensBefore
+        ? `Session compacted (tokensBefore: ${tokensBefore})`
+        : "Session compacted";
+      vscode.window.showInformationMessage(compactMsg);
+      if (summary) {
+        sidebarProvider.sendMessageToWebview({
+          type: "addMessage",
+          content: `📦 Compaction summary:\n${summary}`,
+        });
+      }
+      outputChannel.appendLine(`[compact] success ${tokensBefore ? `(tokensBefore=${tokensBefore})` : ""}`);
+    } catch (error: any) {
+      vscode.window.showErrorMessage(`Failed to compact: ${error.message}`);
+    }
+  });
+
+  // Configuration change listener
+  const configDisposable = vscode.workspace.onDidChangeConfiguration((e) => {
+    if (e.affectsConfiguration("indusagi-vscode")) {
+      config = vscode.workspace.getConfiguration("indusagi-vscode");
+      outputChannel.appendLine("Configuration changed");
+    }
+  });
+
+  // Register disposables
+  context.subscriptions.push(
+    askCommand, 
+    chatCommand, 
+    clearCommand, 
+    activateCommand, 
+    newSessionCommand,
+    getSessionHistoryCommand,
+    switchSessionCommand,
+    setSessionAliasCommand,
+    getStateCommand,
+    cycleModelCommand,
+    getModelsCommand,
+    setModelCommand,
+    cycleThinkingCommand,
+    getThinkingOptionsCommand,
+    setThinkingCommand,
+    getStatsCommand,
+    exportHtmlCommand,
+    compactCommand,
+    configDisposable
+  );
+
+  vscode.window.showInformationMessage("Indusagi VS Code extension is ready!");
 }
 
 export function deactivate() {
-  deactivate();
+  rpc.stop();
+  outputChannel?.appendLine("Indusagi extension deactivated");
 }

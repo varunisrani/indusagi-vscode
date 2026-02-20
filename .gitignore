@@ -1,0 +1,7 @@
+node_modules/
+out/
+.vscode/
+*.vsix
+.DS_Store
+BUTTON_FIX_SUMMARY.md
+test-buttons.html
